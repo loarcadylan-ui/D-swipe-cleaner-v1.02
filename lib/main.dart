@@ -21,7 +21,7 @@ class SwipeCleanApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'SwipeClean - Galería Tinder Style',
+      title: kAppName,
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       darkTheme: ThemeData(
