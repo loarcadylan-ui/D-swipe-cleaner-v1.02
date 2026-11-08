@@ -10,7 +10,7 @@
         android:maxSdkVersion="29" />
 
     <application
-        android:label="SwipeClean"
+        android:label="D Swipe Cleaner"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:requestLegacyExternalStorage="true">
