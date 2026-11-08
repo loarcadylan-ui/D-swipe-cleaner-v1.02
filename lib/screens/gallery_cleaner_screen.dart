@@ -1,6 +1,44 @@
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+const String kAppName = 'D Swipe Cleaner';
+
+/// Guarda en el teléfono qué fotos ya decidiste, para continuar donde te quedaste.
+class _ProgressStore {
+  static const String _keptKey = 'kept_ids';
+  static const String _trashKey = 'trash_entries'; // formato "id|bytes"
+
+  late SharedPreferences _prefs;
+
+  /// Fotos que decidiste conservar.
+  final Set<String> keptIds = {};
+
+  /// Fotos marcadas para borrar (id -> tamaño en bytes), aún sin borrar.
+  final Map<String, int> trashSizes = {};
+
+  Future<void> load() async {
+    _prefs = await SharedPreferences.getInstance();
+    keptIds
+      ..clear()
+      ..addAll(_prefs.getStringList(_keptKey) ?? const <String>[]);
+    trashSizes.clear();
+    for (final entry in _prefs.getStringList(_trashKey) ?? const <String>[]) {
+      final i = entry.lastIndexOf('|');
+      if (i <= 0) continue;
+      trashSizes[entry.substring(0, i)] = int.tryParse(entry.substring(i + 1)) ?? 0;
+    }
+  }
+
+  Future<void> save() async {
+    await _prefs.setStringList(_keptKey, keptIds.toList());
+    await _prefs.setStringList(
+      _trashKey,
+      trashSizes.entries.map((e) => '${e.key}|${e.value}').toList(),
+    );
+  }
+}
 
 class GalleryCleanerScreen extends StatefulWidget {
   const GalleryCleanerScreen({super.key});
@@ -10,18 +48,34 @@ class GalleryCleanerScreen extends StatefulWidget {
 }
 
 class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
+  static const int _batchSize = 100;
+
+  final _ProgressStore _store = _ProgressStore();
+
   bool _isLoading = true;
   bool _hasPermission = false;
-  List<AssetEntity> _assets = [];
-  int _currentIndex = 0;
-  final List<AssetEntity> _trashedAssets = [];
-  final List<AssetEntity> _keptAssets = [];
-  int _bytesFreed = 0;
-  final Map<String, int> _sizes = {}; // id de foto -> bytes
   bool _busy = false;
+  bool _exhausted = false; // ya no quedan fotos sin revisar
+
+  AssetPathEntity? _album;
+  int _totalCount = 0;
+
+  List<AssetEntity> _assets = []; // lote actual (hasta 100 fotos sin revisar)
+  int _currentIndex = 0;
+  final List<AssetEntity> _trashAssets = []; // marcadas para borrar (todas las sesiones)
 
   // Offset para animación visual del swipe
   Offset _dragOffset = Offset.zero;
+
+  int get _bytesMarked => _store.trashSizes.values.fold<int>(0, (sum, b) => sum + b);
+
+  int get _remaining {
+    final decided = _store.keptIds.length + _store.trashSizes.length;
+    final r = _totalCount - decided;
+    return r < 0 ? 0 : r;
+  }
+
+  String get _markedMb => (_bytesMarked / (1024 * 1024)).toStringAsFixed(1);
 
   @override
   void initState() {
@@ -32,7 +86,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
   Future<void> _requestPermissionAndLoad() async {
     setState(() => _isLoading = true);
 
-    // 1. Solicitar permisos de almacenamiento/fotos en Android (API 33+ READ_MEDIA_IMAGES y versiones anteriores)
+    // 1. Permisos de fotos en Android (READ_MEDIA_IMAGES en API 33+ y anteriores)
     final PermissionState ps = await PhotoManager.requestPermissionExtend();
     if (!(ps.isAuth || ps == PermissionState.limited)) {
       setState(() {
@@ -41,27 +95,85 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
       });
       return;
     }
+    _hasPermission = true;
 
-    setState(() => _hasPermission = true);
+    // 2. Recuperar el progreso guardado, la papelera y el siguiente lote
+    await _store.load();
+    await _loadAlbum();
+    await _restoreTrash();
+    await _loadNextBatch();
+  }
 
-    // 2. Obtener álbumes (Cámara y Screenshots)
+  Future<void> _loadAlbum() async {
     final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
       type: RequestType.image,
       onlyAll: true,
     );
-
-    if (albums.isNotEmpty) {
-      final List<AssetEntity> photos = await albums.first.getAssetListRange(
-        start: 0,
-        end: 100, // Primer lote de 100 fotos
-      );
-      setState(() {
-        _assets = photos;
-        _isLoading = false;
-      });
-    } else {
-      setState(() => _isLoading = false);
+    if (albums.isEmpty) {
+      _album = null;
+      _totalCount = 0;
+      return;
     }
+    _album = albums.first;
+    _totalCount = await albums.first.assetCountAsync;
+  }
+
+  /// Vuelve a cargar las fotos que estaban marcadas para borrar en sesiones anteriores.
+  Future<void> _restoreTrash() async {
+    _trashAssets.clear();
+    final List<String> missing = [];
+    for (final id in _store.trashSizes.keys.toList()) {
+      final asset = await AssetEntity.fromId(id);
+      if (asset == null) {
+        missing.add(id); // ya no existe (la borraste desde otra app)
+      } else {
+        _trashAssets.add(asset);
+      }
+    }
+    if (missing.isNotEmpty) {
+      for (final id in missing) {
+        _store.trashSizes.remove(id);
+      }
+      await _store.save();
+    }
+  }
+
+  /// Carga las siguientes [_batchSize] fotos que todavía no has revisado.
+  Future<void> _loadNextBatch() async {
+    setState(() => _isLoading = true);
+
+    final album = _album;
+    final List<AssetEntity> batch = [];
+
+    if (album != null) {
+      final Set<String> decided = {..._store.keptIds, ..._store.trashSizes.keys};
+      const int page = 200;
+      int start = 0;
+      while (batch.length < _batchSize) {
+        final List<AssetEntity> chunk = await album.getAssetListRange(
+          start: start,
+          end: start + page,
+        );
+        if (chunk.isEmpty) break;
+        for (final a in chunk) {
+          if (!decided.contains(a.id)) {
+            batch.add(a);
+            if (batch.length >= _batchSize) break;
+          }
+        }
+        if (chunk.length < page) break;
+        start += page;
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _assets = batch;
+      _currentIndex = 0;
+      _dragOffset = Offset.zero;
+      _exhausted = batch.length < _batchSize;
+      _isLoading = false;
+    });
   }
 
   Future<void> _swipeLeftTrash() async {
@@ -76,66 +188,102 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
     if (!mounted) return;
 
     setState(() {
-      _trashedAssets.add(current);
-      _sizes[current.id] = size;
-      _bytesFreed += size;
+      _trashAssets.add(current);
+      _store.trashSizes[current.id] = size;
       _currentIndex++;
       _dragOffset = Offset.zero;
     });
     _busy = false;
+    _store.save();
   }
 
   void _swipeRightKeep() {
-    if (_currentIndex >= _assets.length) return;
+    if (_busy || _currentIndex >= _assets.length) return;
     final current = _assets[_currentIndex];
     setState(() {
-      _keptAssets.add(current);
+      _store.keptIds.add(current.id);
       _currentIndex++;
       _dragOffset = Offset.zero;
     });
+    _store.save();
   }
 
   void _undo() {
-    if (_currentIndex <= 0) return;
+    if (_busy || _currentIndex <= 0) return;
     setState(() {
       _currentIndex--;
       final undone = _assets[_currentIndex];
-      if (_trashedAssets.remove(undone)) {
-        _bytesFreed -= _sizes.remove(undone.id) ?? 0;
-        if (_bytesFreed < 0) _bytesFreed = 0;
+      _store.keptIds.remove(undone.id);
+      if (_store.trashSizes.remove(undone.id) != null) {
+        _trashAssets.removeWhere((a) => a.id == undone.id);
       }
-      _keptAssets.remove(undone);
       _dragOffset = Offset.zero;
     });
+    _store.save();
   }
 
-  // Borra de verdad las fotos marcadas (Android pide confirmación al usuario)
+  /// Borra de verdad las fotos marcadas (Android pide confirmación al usuario).
   Future<void> _deleteTrashed(BuildContext sheetContext) async {
-    final ids = _trashedAssets.map((e) => e.id).toList();
+    final ids = _store.trashSizes.keys.toList();
     if (ids.isEmpty) {
       Navigator.pop(sheetContext);
       return;
     }
-    final deletedIds = await PhotoManager.editor.deleteWithIds(ids);
+    final List<String> deletedIds = await PhotoManager.editor.deleteWithIds(ids);
     if (!mounted) return;
     final deleted = deletedIds.toSet();
+
+    final removedBeforeCursor =
+        _assets.take(_currentIndex).where((a) => deleted.contains(a.id)).length;
 
     setState(() {
       // Solo quitamos las que Android realmente borró (si cancelas, se conservan)
       _assets.removeWhere((a) => deleted.contains(a.id));
-      _trashedAssets.removeWhere((a) => deleted.contains(a.id));
+      int newIndex = _currentIndex - removedBeforeCursor;
+      if (newIndex < 0) newIndex = 0;
+      if (newIndex > _assets.length) newIndex = _assets.length;
+      _currentIndex = newIndex;
+
+      _trashAssets.removeWhere((a) => deleted.contains(a.id));
       for (final id in deleted) {
-        _sizes.remove(id);
+        _store.trashSizes.remove(id);
       }
-      _bytesFreed = _trashedAssets.fold<int>(0, (sum, a) => sum + (_sizes[a.id] ?? 0));
-      // Volvemos a la primera foto que aún no hayas decidido
-      final pending = _assets.indexWhere(
-        (a) => !_trashedAssets.contains(a) && !_keptAssets.contains(a),
-      );
-      _currentIndex = pending == -1 ? _assets.length : pending;
       _dragOffset = Offset.zero;
     });
-    Navigator.pop(sheetContext);
+    await _store.save();
+    await _loadAlbum();
+    if (!mounted) return;
+    setState(() {});
+    if (sheetContext.mounted) Navigator.pop(sheetContext);
+  }
+
+  Future<void> _resetProgress() async {
+    final bool? ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('¿Reiniciar progreso?'),
+        content: const Text(
+          'Volverás a ver todas las fotos desde el principio y se quitarán las marcas de la papelera. No se borra ninguna foto.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Reiniciar'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    _store.keptIds.clear();
+    _store.trashSizes.clear();
+    _trashAssets.clear();
+    await _store.save();
+    await _loadNextBatch();
   }
 
   @override
@@ -164,7 +312,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'SwipeClean necesita acceso a fotos y capturas para poder analizarlas y ayudarte a liberar espacio.',
+                  '$kAppName necesita acceso a tus fotos para poder mostrarlas y ayudarte a liberar espacio.',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.grey),
                 ),
@@ -190,16 +338,27 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('SwipeClean', style: TextStyle(fontWeight: FontWeight.bold)),
+        title: const Text(kAppName, style: TextStyle(fontWeight: FontWeight.bold)),
         backgroundColor: Colors.transparent,
         elevation: 0,
         actions: [
           IconButton(
             icon: Badge(
-              label: Text('${_trashedAssets.length}'),
+              label: Text('${_trashAssets.length}'),
               child: const Icon(Icons.delete_outline),
             ),
             onPressed: () => _showTrashDialog(),
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'reset') _resetProgress();
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem<String>(
+                value: 'reset',
+                child: Text('Reiniciar progreso'),
+              ),
+            ],
           ),
         ],
       ),
@@ -214,12 +373,16 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Text(
-                          'Foto ${_currentIndex + 1} de ${_assets.length}',
-                          style: const TextStyle(color: Colors.grey, fontSize: 13),
+                        Flexible(
+                          child: Text(
+                            'Foto ${_currentIndex + 1} de ${_assets.length} · $_remaining sin revisar',
+                            style: const TextStyle(color: Colors.grey, fontSize: 13),
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
+                        const SizedBox(width: 8),
                         Text(
-                          '${(_bytesFreed / (1024 * 1024)).toStringAsFixed(1)} MB marcados',
+                          '$_markedMb MB marcados',
                           style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold),
                         ),
                       ],
@@ -297,7 +460,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
                 ),
               ),
 
-              // Sello visual "ELIMINAR" al deslizar a la izquierda
+              // Sello visual "PAPELERA" al deslizar a la izquierda
               if (_dragOffset.dx < -30)
                 Positioned(
                   top: 30,
@@ -430,29 +593,39 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
           children: [
             const Icon(Icons.check_circle_outline, color: Colors.greenAccent, size: 80),
             const SizedBox(height: 16),
-            const Text(
-              '¡Lote Limpiado!',
-              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+            Text(
+              _exhausted ? '¡Galería completa!' : '¡Lote terminado!',
+              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
             Text(
-              'Marcaste ${(_bytesFreed / (1024 * 1024)).toStringAsFixed(1)} MB (${_trashedAssets.length} fotos) para borrar. Abre la papelera (arriba a la derecha) para eliminarlas.',
+              _exhausted
+                  ? 'No quedan fotos por revisar.'
+                  : 'Quedan unas $_remaining fotos sin revisar.',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white70),
             ),
-            const SizedBox(height: 24),
-            ElevatedButton(
-              onPressed: () {
-                setState(() {
-                  _currentIndex = 0;
-                  _trashedAssets.clear();
-                  _keptAssets.clear();
-                  _bytesFreed = 0;
-                  _sizes.clear();
-                });
-              },
-              child: const Text('Reiniciar Limpieza'),
+            const SizedBox(height: 8),
+            Text(
+              'Papelera: ${_trashAssets.length} fotos · $_markedMb MB esperando para borrarse.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white54, fontSize: 13),
             ),
+            const SizedBox(height: 24),
+            if (!_exhausted)
+              ElevatedButton.icon(
+                onPressed: _loadNextBatch,
+                icon: const Icon(Icons.arrow_forward_rounded),
+                label: const Text('Siguiente lote de $_batchSize'),
+              ),
+            if (_trashAssets.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: _showTrashDialog,
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('Abrir papelera'),
+              ),
+            ],
           ],
         ),
       ),
@@ -473,12 +646,12 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Papelera (${_trashedAssets.length} elementos)',
+              'Papelera (${_trashAssets.length} fotos · $_markedMb MB)',
               style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
             const Text(
-              'Las fotos marcadas pueden ser borradas definitivamente del almacenamiento de tu teléfono con confirmación de Android.',
+              'Las fotos marcadas se borrarán del almacenamiento de tu teléfono cuando confirmes en el aviso de Android.',
               style: TextStyle(color: Colors.white70, fontSize: 13),
             ),
             const SizedBox(height: 20),
@@ -500,7 +673,6 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
     );
   }
 }
-
 
 /// Muestra la miniatura de una foto usando solo el paquete photo_manager.
 class _AssetThumb extends StatefulWidget {
