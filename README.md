@@ -1,4 +1,4 @@
-# 📱 SwipeClean - Limpiador de Galería Android en Flutter
+# 📱 D Swipe Cleaner - Limpiador de Galería Android en Flutter
 
 Aplicación de uso personal estilo Tinder para limpiar fotos y capturas de pantalla rápidamente deslizando a la izquierda (papelera) o derecha (conservar).
 
@@ -28,7 +28,7 @@ chmod +x build_apk.sh
 Si no tienes Flutter instalado en tu computadora:
 1. Sube esta carpeta a un repositorio privado de **GitHub**.
 2. Ve a la pestaña **Actions** en GitHub.
-3. El workflow `Compilar APK Android SwipeClean` se ejecutará automáticamente.
+3. El workflow `Compilar APK D Swipe Cleaner` se ejecutará automáticamente.
 4. En 2 minutos podrás descargar el archivo APK directamente en la sección **Artifacts** de GitHub.
 
 ---
@@ -44,4 +44,12 @@ Si no tienes Flutter instalado en tu computadora:
      ```
 2. En tu móvil, toca el archivo descargado.
 3. Si Android muestra el aviso "Instalar aplicaciones desconocidas", pulsa **Configuración** y activa el interruptor para permitirlo (esto es normal en APKs personales sin firmar de Google Play).
-4. Abre **SwipeClean**, concede el permiso de galería y ¡a limpiar fotos deslizando!
+4. Abre **D Swipe Cleaner**, concede el permiso de galería y ¡a limpiar fotos deslizando!
+
+---
+
+## 🔁 Actualizar la app
+
+Sube los archivos cambiados al mismo repositorio de GitHub (mismo nombre de archivo = se reemplaza) y el workflow generará un APK nuevo. Gracias a la llave de firma fija en `android/app/keystore/`, el APK nuevo se instala encima del anterior sin perder tu progreso.
+
+> Mantén el repositorio **privado**: la llave de firma está incluida en él.

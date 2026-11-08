@@ -1,5 +1,5 @@
 name: swipe_clean
-description: "Limpiador de galería estilo Tinder para Android de uso personal"
+description: "D Swipe Cleaner: limpiador de galería estilo Tinder para Android de uso personal"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -11,6 +11,8 @@ dependencies:
     sdk: flutter
   # Acceso eficiente a fotos y capturas del dispositivo Android
   photo_manager: ^3.1.2
+  # Guarda el progreso (qué fotos ya revisaste) entre sesiones
+  shared_preferences: ^2.2.3
   # Íconos y animaciones
   cupertino_icons: ^1.0.8
 
