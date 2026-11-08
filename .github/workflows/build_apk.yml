@@ -1,1 +1,46 @@
+name: Compilar APK Android SwipeClean
 
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Permite pulsar "Run workflow" manualmente en GitHub
+
+jobs:
+  build:
+    name: Compilar Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configurar Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.x'
+          channel: 'stable'
+          cache: true
+
+      # Genera los archivos de Android que faltan (gradle, iconos, estilos...)
+      # sin sobrescribir los que ya existen en el proyecto.
+      - name: Completar proyecto Android
+        run: flutter create . --platforms=android --org com.personal --project-name swipe_clean
+
+      - name: Instalar dependencias de Flutter
+        run: flutter pub get
+
+      - name: Compilar APK Release
+        run: flutter build apk --release
+
+      - name: Subir APK como artefacto descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwipeClean-Android-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 14
