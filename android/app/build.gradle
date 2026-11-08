@@ -44,9 +44,20 @@ android {
         versionName flutterVersionName
     }
 
+    // Llave fija de uso personal: asi cada APK nuevo se instala SOBRE el anterior
+    // (con la llave de debug, que cambia en cada compilacion en GitHub, Android lo rechaza).
+    signingConfigs {
+        release {
+            storeFile file("keystore/dswipe.jks")
+            storePassword "dswipecleaner"
+            keyAlias "dswipe"
+            keyPassword "dswipecleaner"
+        }
+    }
+
     buildTypes {
         release {
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.release
             minifyEnabled false
             shrinkResources false
         }
