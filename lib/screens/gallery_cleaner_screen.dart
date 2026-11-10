@@ -1,5 +1,7 @@
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -9,17 +11,39 @@ const String kAppName = 'D Swipe Cleaner';
 class _ProgressStore {
   static const String _keptKey = 'kept_ids';
   static const String _trashKey = 'trash_entries'; // formato "id|bytes"
+  static const String _tutorialKey = 'tutorial_seen';
+  static const String _hapticKey = 'haptic_enabled';
+  static const String _freedKey = 'freed_bytes';
 
   late SharedPreferences _prefs;
 
   /// Fotos que decidiste conservar.
   final Set<String> keptIds = {};
 
-  /// Fotos marcadas para borrar (id -> tamaño en bytes), aún sin borrar.
+  /// Fotos marcadas para borrar, aún sin borrar (id -> tamaño en bytes).
   final Map<String, int> trashSizes = {};
+
+  /// Total de bytes que ya has borrado de verdad (acumulado).
+  int freedBytes = 0;
+
+  /// Vibración al decidir una foto.
+  bool hapticEnabled = true;
+
+  bool get tutorialSeen => _prefs.getBool(_tutorialKey) ?? false;
+
+  Future<void> markTutorialSeen() async {
+    await _prefs.setBool(_tutorialKey, true);
+  }
+
+  Future<void> setHaptic(bool value) async {
+    hapticEnabled = value;
+    await _prefs.setBool(_hapticKey, value);
+  }
 
   Future<void> load() async {
     _prefs = await SharedPreferences.getInstance();
+    hapticEnabled = _prefs.getBool(_hapticKey) ?? true;
+    freedBytes = _prefs.getInt(_freedKey) ?? 0;
     keptIds
       ..clear()
       ..addAll(_prefs.getStringList(_keptKey) ?? const <String>[]);
@@ -37,6 +61,7 @@ class _ProgressStore {
       _trashKey,
       trashSizes.entries.map((e) => '${e.key}|${e.value}').toList(),
     );
+    await _prefs.setInt(_freedKey, freedBytes);
   }
 }
 
@@ -51,6 +76,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
   static const int _batchSize = 100;
 
   final _ProgressStore _store = _ProgressStore();
+  final Random _random = Random();
 
   bool _isLoading = true;
   bool _hasPermission = false;
@@ -58,7 +84,9 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
   bool _exhausted = false; // ya no quedan fotos sin revisar
 
   AssetPathEntity? _album;
-  int _totalCount = 0;
+
+  int _pendingInAlbum = 0; // fotos sin revisar al cargar el lote
+  int _decidedInBatch = 0; // decisiones tomadas en el lote actual
 
   List<AssetEntity> _assets = []; // lote actual (hasta 100 fotos sin revisar)
   int _currentIndex = 0;
@@ -67,15 +95,25 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
   // Offset para animación visual del swipe
   Offset _dragOffset = Offset.zero;
 
-  int get _bytesMarked => _store.trashSizes.values.fold<int>(0, (sum, b) => sum + b);
-
   int get _remaining {
-    final decided = _store.keptIds.length + _store.trashSizes.length;
-    final r = _totalCount - decided;
+    final r = _pendingInAlbum - _decidedInBatch;
     return r < 0 ? 0 : r;
   }
 
-  String get _markedMb => (_bytesMarked / (1024 * 1024)).toStringAsFixed(1);
+  int get _pendingTrashBytes => _store.trashSizes.values.fold<int>(0, (sum, b) => sum + b);
+
+  String _mb(int bytes) => (bytes / (1024 * 1024)).toStringAsFixed(1);
+
+  void _haptic() {
+    if (_store.hapticEnabled) HapticFeedback.lightImpact();
+  }
+
+  Future<void> _toggleHaptic() async {
+    await _store.setHaptic(!_store.hapticEnabled);
+    if (!mounted) return;
+    setState(() {});
+    _haptic(); // vibración de muestra al activarla
+  }
 
   @override
   void initState() {
@@ -102,6 +140,22 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
     await _loadAlbum();
     await _restoreTrash();
     await _loadNextBatch();
+
+    // 3. Tutorial la primera vez
+    if (!_store.tutorialSeen && mounted) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _showTutorial();
+      });
+    }
+  }
+
+  Future<void> _showTutorial() async {
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const _TutorialDialog(),
+    );
+    await _store.markTutorialSeen();
   }
 
   Future<void> _loadAlbum() async {
@@ -109,13 +163,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
       type: RequestType.image,
       onlyAll: true,
     );
-    if (albums.isEmpty) {
-      _album = null;
-      _totalCount = 0;
-      return;
-    }
-    _album = albums.first;
-    _totalCount = await albums.first.assetCountAsync;
+    _album = albums.isEmpty ? null : albums.first;
   }
 
   /// Vuelve a cargar las fotos que estaban marcadas para borrar en sesiones anteriores.
@@ -138,40 +186,43 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
     }
   }
 
-  /// Carga las siguientes [_batchSize] fotos que todavía no has revisado.
+  /// Carga [_batchSize] fotos al azar entre las que todavía no has revisado.
   Future<void> _loadNextBatch() async {
     setState(() => _isLoading = true);
 
     final album = _album;
-    final List<AssetEntity> batch = [];
+    final List<AssetEntity> pendingAll = [];
 
     if (album != null) {
       final Set<String> decided = {..._store.keptIds, ..._store.trashSizes.keys};
-      const int page = 200;
+      const int page = 500;
       int start = 0;
-      while (batch.length < _batchSize) {
+      while (true) {
         final List<AssetEntity> chunk = await album.getAssetListRange(
           start: start,
           end: start + page,
         );
         if (chunk.isEmpty) break;
         for (final a in chunk) {
-          if (!decided.contains(a.id)) {
-            batch.add(a);
-            if (batch.length >= _batchSize) break;
-          }
+          if (!decided.contains(a.id)) pendingAll.add(a);
         }
         if (chunk.length < page) break;
         start += page;
       }
     }
 
+    // Orden aleatorio: mezcla fotos viejas y nuevas
+    pendingAll.shuffle(_random);
+    final List<AssetEntity> batch = pendingAll.take(_batchSize).toList();
+
     if (!mounted) return;
     setState(() {
       _assets = batch;
       _currentIndex = 0;
+      _decidedInBatch = 0;
+      _pendingInAlbum = pendingAll.length;
       _dragOffset = Offset.zero;
-      _exhausted = batch.length < _batchSize;
+      _exhausted = pendingAll.length <= _batchSize;
       _isLoading = false;
     });
   }
@@ -191,9 +242,11 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
       _trashAssets.add(current);
       _store.trashSizes[current.id] = size;
       _currentIndex++;
+      _decidedInBatch++;
       _dragOffset = Offset.zero;
     });
     _busy = false;
+    _haptic();
     _store.save();
   }
 
@@ -203,8 +256,10 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
     setState(() {
       _store.keptIds.add(current.id);
       _currentIndex++;
+      _decidedInBatch++;
       _dragOffset = Offset.zero;
     });
+    _haptic();
     _store.save();
   }
 
@@ -212,6 +267,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
     if (_busy || _currentIndex <= 0) return;
     setState(() {
       _currentIndex--;
+      if (_decidedInBatch > 0) _decidedInBatch--;
       final undone = _assets[_currentIndex];
       _store.keptIds.remove(undone.id);
       if (_store.trashSizes.remove(undone.id) != null) {
@@ -246,6 +302,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
 
       _trashAssets.removeWhere((a) => deleted.contains(a.id));
       for (final id in deleted) {
+        _store.freedBytes += _store.trashSizes[id] ?? 0;
         _store.trashSizes.remove(id);
       }
       _dragOffset = Offset.zero;
@@ -286,6 +343,85 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
     await _loadNextBatch();
   }
 
+  // ---------------------------------------------------------------------------
+  // Información de la foto (deslizar hacia arriba)
+  // ---------------------------------------------------------------------------
+
+  String _fmtDate(DateTime d) {
+    final l = d.toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(l.day)}/${two(l.month)}/${l.year}  ${two(l.hour)}:${two(l.minute)}';
+  }
+
+  Future<String> _fileSizeText(AssetEntity asset) async {
+    try {
+      final file = await asset.file;
+      if (file == null) return 'Desconocido';
+      final int b = await file.length();
+      if (b >= 1024 * 1024) return '${(b / (1024 * 1024)).toStringAsFixed(1)} MB';
+      return '${(b / 1024).toStringAsFixed(0)} KB';
+    } catch (_) {
+      return 'Desconocido';
+    }
+  }
+
+  Widget _infoRow(IconData icon, String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 20, color: Colors.white54),
+          const SizedBox(width: 12),
+          SizedBox(
+            width: 90,
+            child: Text(label, style: const TextStyle(color: Colors.white54)),
+          ),
+          Expanded(child: Text(value)),
+        ],
+      ),
+    );
+  }
+
+  void _showInfoSheet(AssetEntity asset) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF131B2E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Información de la foto',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 12),
+              _infoRow(Icons.badge_outlined, 'Nombre', asset.title ?? 'Sin nombre'),
+              _infoRow(Icons.event_outlined, 'Fecha', _fmtDate(asset.createDateTime)),
+              _infoRow(Icons.aspect_ratio, 'Resolución', '${asset.width} × ${asset.height} px'),
+              _infoRow(Icons.folder_outlined, 'Carpeta', asset.relativePath ?? 'Desconocida'),
+              FutureBuilder<String>(
+                future: _fileSizeText(asset),
+                builder: (context, snapshot) =>
+                    _infoRow(Icons.sd_storage_outlined, 'Peso', snapshot.data ?? 'Calculando…'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Interfaz
+  // ---------------------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
@@ -312,7 +448,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  '$kAppName necesita acceso a tus fotos para poder mostrarlas y ayudarte a liberar espacio.',
+                  '$kAppName necesita acceso a tus fotos para poder mostrarlas y ayudarte a limpiar tu galería.',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.grey),
                 ),
@@ -351,9 +487,34 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
           ),
           PopupMenuButton<String>(
             onSelected: (value) {
-              if (value == 'reset') _resetProgress();
+              switch (value) {
+                case 'haptic':
+                  _toggleHaptic();
+                  break;
+                case 'tutorial':
+                  _showTutorial();
+                  break;
+                case 'reset':
+                  _resetProgress();
+                  break;
+              }
             },
-            itemBuilder: (context) => const [
+            itemBuilder: (context) => [
+              PopupMenuItem<String>(
+                value: 'haptic',
+                child: Row(
+                  children: [
+                    const Expanded(child: Text('Vibración')),
+                    IgnorePointer(
+                      child: Switch(value: _store.hapticEnabled, onChanged: (_) {}),
+                    ),
+                  ],
+                ),
+              ),
+              PopupMenuItem<String>(
+                value: 'tutorial',
+                child: Text('Ver tutorial'),
+              ),
               PopupMenuItem<String>(
                 value: 'reset',
                 child: Text('Reiniciar progreso'),
@@ -367,7 +528,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
             ? _buildFinishedView()
             : Column(
                 children: [
-                  // Barra de progreso y contador
+                  // Contador de progreso
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
                     child: Row(
@@ -382,8 +543,12 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
                         ),
                         const SizedBox(width: 8),
                         Text(
-                          '$_markedMb MB marcados',
-                          style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold),
+                          '${_mb(_store.freedBytes)} MB borrados',
+                          style: const TextStyle(
+                            color: Colors.greenAccent,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
                         ),
                       ],
                     ),
@@ -403,6 +568,10 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
                             _swipeLeftTrash();
                           } else if (_dragOffset.dx > 120) {
                             _swipeRightKeep();
+                          } else if (_dragOffset.dy < -120 && _dragOffset.dx.abs() < 100) {
+                            final asset = _assets[_currentIndex];
+                            setState(() => _dragOffset = Offset.zero);
+                            _showInfoSheet(asset);
                           } else {
                             setState(() => _dragOffset = Offset.zero);
                           }
@@ -514,6 +683,36 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
                   ),
                 ),
 
+              // Sello visual "INFO" al deslizar hacia arriba
+              if (_dragOffset.dy < -30 && _dragOffset.dx.abs() < 60)
+                Positioned(
+                  bottom: 90,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Opacity(
+                      opacity: (-_dragOffset.dy / 120).clamp(0.0, 1.0),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        decoration: BoxDecoration(
+                          border: Border.all(color: Colors.lightBlueAccent, width: 3),
+                          borderRadius: BorderRadius.circular(12),
+                          color: Colors.blue.withOpacity(0.2),
+                        ),
+                        child: const Text(
+                          'INFO',
+                          style: TextStyle(
+                            color: Colors.lightBlueAccent,
+                            fontWeight: FontWeight.w900,
+                            fontSize: 22,
+                            letterSpacing: 2,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
               // Datos del archivo en la parte inferior
               Positioned(
                 bottom: 20,
@@ -534,7 +733,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      '${asset.width}x${asset.height} · ${asset.createDateTime.toLocal().toString().substring(0, 16)}',
+                      '${asset.width}x${asset.height} · ${_fmtDate(asset.createDateTime)}',
                       style: const TextStyle(color: Colors.white70, fontSize: 13),
                     ),
                   ],
@@ -553,7 +752,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
-          // Botón Deslizar a la izquierda: Eliminar
+          // Botón Deslizar a la izquierda: a la papelera
           FloatingActionButton.large(
             heroTag: 'btn_trash',
             onPressed: _swipeLeftTrash,
@@ -594,20 +793,20 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
             const Icon(Icons.check_circle_outline, color: Colors.greenAccent, size: 80),
             const SizedBox(height: 16),
             Text(
-              _exhausted ? '¡Galería completa!' : '¡Lote terminado!',
+              _exhausted ? '¡Todo revisado!' : '¡Lote terminado!',
               style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
             Text(
-              _exhausted
-                  ? 'No quedan fotos por revisar.'
-                  : 'Quedan unas $_remaining fotos sin revisar.',
+              _exhausted ? 'No quedan fotos por revisar.' : 'Quedan $_remaining fotos sin revisar.',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white70),
             ),
             const SizedBox(height: 8),
             Text(
-              'Papelera: ${_trashAssets.length} fotos · $_markedMb MB esperando para borrarse.',
+              _trashAssets.isEmpty
+                  ? 'Tu papelera está vacía.'
+                  : 'Papelera: ${_trashAssets.length} fotos (${_mb(_pendingTrashBytes)} MB) esperando para borrarse.',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, fontSize: 13),
             ),
@@ -633,7 +832,7 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
   }
 
   void _showTrashDialog() {
-    showModalBottomSheet(
+    showModalBottomSheet<void>(
       context: context,
       backgroundColor: const Color(0xFF131B2E),
       shape: const RoundedRectangleBorder(
@@ -646,12 +845,12 @@ class _GalleryCleanerScreenState extends State<GalleryCleanerScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Papelera (${_trashAssets.length} fotos · $_markedMb MB)',
+              'Papelera (${_trashAssets.length} fotos · ${_mb(_pendingTrashBytes)} MB)',
               style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
             const Text(
-              'Las fotos marcadas se borrarán del almacenamiento de tu teléfono cuando confirmes en el aviso de Android.',
+              'Las fotos marcadas se borrarán de tu teléfono cuando confirmes en el aviso de Android.',
               style: TextStyle(color: Colors.white70, fontSize: 13),
             ),
             const SizedBox(height: 20),
@@ -701,6 +900,161 @@ class _AssetThumbState extends State<_AssetThumb> {
         }
         return Image.memory(data, fit: BoxFit.cover, gaplessPlayback: true);
       },
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Mini tutorial de primer uso
+// -----------------------------------------------------------------------------
+
+class _TutorialStep {
+  const _TutorialStep({
+    required this.icon,
+    required this.color,
+    required this.title,
+    required this.text,
+  });
+  final IconData icon;
+  final Color color;
+  final String title;
+  final String text;
+}
+
+class _TutorialDialog extends StatefulWidget {
+  const _TutorialDialog();
+
+  @override
+  State<_TutorialDialog> createState() => _TutorialDialogState();
+}
+
+class _TutorialDialogState extends State<_TutorialDialog> {
+  static const List<_TutorialStep> _steps = [
+    _TutorialStep(
+      icon: Icons.arrow_back_rounded,
+      color: Color(0xFFEF4444),
+      title: 'Izquierda: a la papelera',
+      text: 'Desliza a la izquierda las fotos que no necesitas: capturas, memes, comidas repetidas...',
+    ),
+    _TutorialStep(
+      icon: Icons.arrow_forward_rounded,
+      color: Color(0xFF10B981),
+      title: 'Derecha: conservar',
+      text: 'Las fotos importantes se quedan intactas, en su calidad original.',
+    ),
+    _TutorialStep(
+      icon: Icons.arrow_upward_rounded,
+      color: Color(0xFF38BDF8),
+      title: 'Arriba: ver información',
+      text: 'Desliza hacia arriba para ver nombre, fecha, carpeta y peso antes de decidir.',
+    ),
+    _TutorialStep(
+      icon: Icons.verified_user_outlined,
+      color: Color(0xFF6366F1),
+      title: 'Tú decides cuándo borrar',
+      text: 'No se borra nada hasta que abres la papelera y confirmas. Tu progreso se guarda para continuar otro día.',
+    ),
+  ];
+
+  final PageController _controller = PageController();
+  int _page = 0;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isLast = _page == _steps.length - 1;
+
+    return Dialog(
+      backgroundColor: const Color(0xFF131B2E),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              height: 250,
+              child: PageView(
+                controller: _controller,
+                onPageChanged: (i) => setState(() => _page = i),
+                children: [
+                  for (final s in _steps)
+                    Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(20),
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: s.color.withOpacity(0.15),
+                          ),
+                          child: Icon(s.icon, size: 56, color: s.color),
+                        ),
+                        const SizedBox(height: 20),
+                        Text(
+                          s.title,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          s.text,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: Colors.white70, height: 1.35),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                for (var i = 0; i < _steps.length; i++)
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    margin: const EdgeInsets.symmetric(horizontal: 4),
+                    width: i == _page ? 20 : 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(4),
+                      color: i == _page ? const Color(0xFF6366F1) : Colors.white24,
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Saltar'),
+                ),
+                const Spacer(),
+                ElevatedButton(
+                  onPressed: () {
+                    if (isLast) {
+                      Navigator.pop(context);
+                    } else {
+                      _controller.nextPage(
+                        duration: const Duration(milliseconds: 250),
+                        curve: Curves.easeOut,
+                      );
+                    }
+                  },
+                  child: Text(isLast ? '¡Empezar!' : 'Siguiente'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
