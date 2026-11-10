@@ -34,6 +34,10 @@ if %errorlevel% neq 0 (
 )
 
 echo.
+echo Generando icono de la app...
+call dart run flutter_launcher_icons
+
+echo.
 echo [3/3] Compilando APK Release (puede tardar unos minutos la primera vez)...
 call flutter build apk --release
 if %errorlevel% neq 0 (

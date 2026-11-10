@@ -18,6 +18,9 @@ flutter create . --platforms=android --org com.personal --project-name swipe_cle
 echo "[3/4] Descargando dependencias..."
 flutter pub get
 
+echo "Generando ícono de la app..."
+dart run flutter_launcher_icons || echo "(No se pudo generar el ícono; se usará el de Flutter)"
+
 echo "[4/4] Compilando APK Release..."
 flutter build apk --release
 
